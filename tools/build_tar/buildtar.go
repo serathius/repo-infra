@@ -20,6 +20,7 @@ package main
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"flag"
@@ -28,13 +29,23 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/blakesmith/ar"
 	"github.com/golang/glog"
+	"github.com/ulikunitz/xz"
 
 	"golang.org/x/build/pargzip"
 )
+
+const (
+	pkgMetadataFile = "control"
+	dpkgStatusDir   = "/var/lib/dpkg/status.d"
+)
+
+var pkgNameRe = regexp.MustCompile(`Package:\s*(?P<pkg_name>\w+).*`)
 
 func main() {
 	var (
@@ -113,7 +124,7 @@ func main() {
 	}
 
 	for _, tar := range tars {
-		if err := tf.addTar(tar); err != nil {
+		if err := tf.addTarFile(tar); err != nil {
 			glog.Fatalf("couldn't add tar: %v", err)
 		}
 	}
@@ -272,38 +283,26 @@ func (f *tarFile) addLink(symlink, target string) error {
 	return f.tw.WriteHeader(&header)
 }
 
-func (f *tarFile) addTar(toAdd string) error {
-	root := ""
-	if f.directory != "/" {
-		root = f.directory
-	}
-
-	var r io.Reader
+func (f *tarFile) addTarFile(toAdd string) error {
 
 	file, err := os.Open(toAdd)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	r = file
+	r := bufio.NewReader(file)
+	return f.addTar(r, toAdd)
+}
 
-	r = bufio.NewReader(r)
-
-	switch {
-	case strings.HasSuffix(toAdd, "gz"):
-		gzr, err := gzip.NewReader(r)
-		if err != nil {
-			return err
-		}
-		r = gzr
-	case strings.HasSuffix(toAdd, "bz2"):
-		bz2r := bzip2.NewReader(r)
-		r = bz2r
-	case strings.HasSuffix(toAdd, "xz"):
-		return fmt.Errorf("%q decompression is not supported yet", toAdd)
-	default:
+func (f *tarFile) addTar(r io.Reader, toAdd string) error {
+	root := ""
+	if f.directory != "/" {
+		root = f.directory
 	}
-
+	r, err := decompress(r, toAdd)
+	if err != nil {
+		return err
+	}
 	tr := tar.NewReader(r)
 
 	for {
@@ -330,7 +329,106 @@ func (f *tarFile) addTar(toAdd string) error {
 }
 
 func (f *tarFile) addDeb(toAdd string) error {
-	return fmt.Errorf("addDeb unimplemented")
+	pkgDataFound, pkgMetadataFound := false, false
+	file, err := os.Open(toAdd)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	tr := ar.NewReader(bufio.NewReader(file))
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		basename := strings.SplitN(header.Name, ".", 2)[0]
+		// BSD variant of ar has file member name terminated with '/'
+		// Source https://www.unix.com/man-page/opensolaris/3HEAD/ar.h/
+		name := strings.TrimRight(header.Name, "/")
+		switch basename {
+		case "data":
+			pkgDataFound = true
+			err = f.addTar(tr, name)
+			if err != nil {
+				return err
+			}
+		case "control":
+			pkgMetadataFound = true
+			f.addPkgMetadata(tr, name)
+		}
+	}
+	if !pkgDataFound {
+		return fmt.Errorf("%s does not contain a data file", toAdd)
+	}
+	if !pkgMetadataFound {
+		return fmt.Errorf("%s does not contain a control file", toAdd)
+	}
+	return nil
+}
+
+func (f *tarFile) addPkgMetadata(r io.Reader, toAdd string) error {
+	r, err := decompress(r, toAdd)
+	if err != nil {
+		return err
+	}
+	tr := tar.NewReader(r)
+	controlFileFound := false
+	var buf bytes.Buffer
+	var header *tar.Header
+	for {
+		header, err = tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if filepath.Base(header.Name) == pkgMetadataFile {
+			controlFileFound = true
+			io.Copy(&buf, r)
+			break
+		}
+
+	}
+	if !controlFileFound {
+		return fmt.Errorf("%s does not contain control file", toAdd)
+	}
+	metadata := buf.String()
+	destinationFile := filepath.Join(dpkgStatusDir, parsePkgName(metadata, toAdd))
+	header.Name = destinationFile
+	if err := f.tw.WriteHeader(header); err != nil {
+		return err
+	}
+	if _, err := f.tw.Write(buf.Bytes()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decompress(r io.Reader, fName string) (io.Reader, error) {
+	switch ext := filepath.Ext(fName); ext {
+	case ".gz":
+		return gzip.NewReader(r)
+	case ".bz2":
+		return bzip2.NewReader(r), nil
+	case ".xz":
+		return xz.NewReader(r)
+	case ".tar":
+		return r, nil
+	default:
+		return nil, fmt.Errorf("%q decompression is not supported yet", ext)
+	}
+}
+
+func parsePkgName(metadata, filename string) string {
+	match := pkgNameRe.FindStringSubmatch(metadata)
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return filepath.Base(strings.TrimSuffix(filename, filepath.Ext(filename)))
 }
 
 func (f *tarFile) makeDirs(header tar.Header) error {
